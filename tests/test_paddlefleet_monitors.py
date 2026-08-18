@@ -682,6 +682,88 @@ class PaddleMoEMonitorTest(unittest.TestCase):
         self.assertAlmostEqual(latest["moe_health/layer_0/shared_gate_stable_rank"], 8.0, places=3)
         self.assertAlmostEqual(latest["moe_health/layer_0/shared_gate_singular_entropy"], math.log(8.0), places=3)
 
+    def _spectrum_clock_layer(self, experts=4, latent=8, inter=8):
+        # The shared expert has to be a real Layer: the norm path walks
+        # ``parameters()`` while the spectrum path only reads up_gate_proj.weight.
+        class SharedExpert(nn.Layer):
+            def __init__(self):
+                super().__init__()
+                self.up_gate_proj = nn.Linear(2 * latent, 2 * inter, bias_attr=False)
+                self.down_proj = nn.Linear(inter, 2 * latent, bias_attr=False)
+
+        return SimpleNamespace(
+            grouped_gemm_experts=SimpleNamespace(
+                weight1=paddle.randn([experts, latent, 2 * inter]),
+                weight2=paddle.randn([experts, inter, latent]),
+            ),
+            experts=None,
+            shared_experts=SharedExpert(),
+        )
+
+    def _spectrum_clock_monitor(self, moe_layer, **kwargs):
+        monitor = PaddleMoEMonitor(log_per_layer=True, log_global=True, **kwargs)
+        monitor._expert_norm_layers = [(0, moe_layer)]
+        for name in (
+            "expert_gate_stable_rank_mean",
+            "expert_gate_stable_rank_min",
+            "expert_gate_stable_rank_max",
+            "expert_gate_singular_entropy_mean",
+            "expert_gate_singular_entropy_min",
+            "expert_gate_singular_entropy_max",
+            "shared_gate_stable_rank",
+            "shared_gate_singular_entropy",
+            "expert_norm_mean",
+            "expert_norm_std",
+            "expert_norm_min",
+            "expert_norm_max",
+            "shared_expert_norm",
+            "shared_routed_ratio",
+        ):
+            monitor.declare_layer_metric(0, name)
+        monitor.allocate_buffers()
+        return monitor
+
+    def _spectrum_clock_trace(self, monitor, steps=7):
+        seen = []
+        for _ in range(steps):
+            training_logs.reset()
+            monitor.collect_expert_norms()
+            monitor.step()
+            keys = training_logs.get_latest(prefix="moe_health")
+            seen.append(
+                (
+                    "moe_health/layer_0/expert_gate_stable_rank_mean" in keys,
+                    "moe_health/layer_0/expert_norm_mean" in keys,
+                )
+            )
+        return seen
+
+    def test_gate_spectrum_rides_a_coarser_clock_than_the_expert_norms(self):
+        """The eigensolve is ~58% of this monitor's cost while a weight spectrum
+        moves over thousands of steps, so it is read every
+        ``gate_spectrum_interval``-th monitored step. The norms are cheap and stay
+        on every one.
+        """
+        monitor = self._spectrum_clock_monitor(self._spectrum_clock_layer(), gate_spectrum_interval=3)
+
+        seen = self._spectrum_clock_trace(monitor)
+
+        self.assertEqual([spectrum for spectrum, _ in seen], [True, False, False, True, False, False, True])
+        self.assertEqual([norm for _, norm in seen], [True] * 7)
+
+    def test_gate_spectrum_interval_of_one_reads_every_monitored_step(self):
+        """The pre-clock behaviour has to remain reachable."""
+        monitor = self._spectrum_clock_monitor(self._spectrum_clock_layer(), gate_spectrum_interval=1)
+
+        seen = self._spectrum_clock_trace(monitor, steps=4)
+
+        self.assertEqual([spectrum for spectrum, _ in seen], [True] * 4)
+
+    def test_gate_spectrum_interval_rejects_non_positive_values(self):
+        """It is a modulus; 0 would raise mid-training instead of at setup."""
+        with self.assertRaises(ValueError):
+            PaddleMoEMonitor(gate_spectrum_interval=0)
+
     def test_compute_gate_spectrum_metrics_skips_layer_without_experts(self):
         """A layer with no expert weights must not raise and records nothing."""
         monitor = PaddleMoEMonitor(log_per_layer=True, log_global=True)

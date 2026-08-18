@@ -401,10 +401,26 @@ class PaddleMoEMonitor(PaddleProbe):
         "router_margin_min",
     }
 
-    def __init__(self, log_per_layer=True, log_global=True, monitor_interval=1, verbose=False):
+    def __init__(
+        self,
+        log_per_layer=True,
+        log_global=True,
+        monitor_interval=1,
+        verbose=False,
+        gate_spectrum_interval=5,
+    ):
         super().__init__(
             log_per_layer=log_per_layer, log_global=log_global, monitor_interval=monitor_interval, verbose=verbose
         )
+        if int(gate_spectrum_interval) < 1:
+            raise ValueError(f"gate_spectrum_interval must be >= 1, got {gate_spectrum_interval}")
+        # The gate spectrum is a full eigensolve per (layer, expert) and measures
+        # ~58% of this monitor's cost, against router and norm metrics that are
+        # cheap. A weight spectrum moves over thousands of steps, so it rides a
+        # coarser clock: one reading every ``gate_spectrum_interval``-th
+        # monitored step. Set it to 1 to restore a reading on every one.
+        self.gate_spectrum_interval = int(gate_spectrum_interval)
+        self._gate_spectrum_samples = 0
         self._patched_gates = []
         self._patched_moe_layers = []
         self._expert_norm_layers = []
@@ -713,18 +729,26 @@ class PaddleMoEMonitor(PaddleProbe):
         return hook_fn
 
     def collect_expert_norms(self):
-        """Compute per-layer expert weight norms for all monitored MoE layers."""
+        """Compute per-layer expert weight norms for all monitored MoE layers.
+
+        The gate spectrum rides ``gate_spectrum_interval``; the norms below are
+        cheap and are read on every monitored step. Sample 0 is due, so the first
+        monitored step still carries a spectrum reading.
+        """
         if not self._buffers_allocated or not self._should_monitor():
             return
+        spectrum_due = self._gate_spectrum_samples % self.gate_spectrum_interval == 0
+        self._gate_spectrum_samples += 1
         pending = []
         shard_group = None
         for layer_idx, moe_layer in self._expert_norm_layers:
-            try:
-                with paddle.no_grad():
-                    self._compute_gate_spectrum_metrics(layer_idx, moe_layer)
-            except Exception as e:
-                if self.verbose:
-                    logger.error(f"[PaddleMoEMonitor] gate-spectrum collect error layer {layer_idx}: {e}")
+            if spectrum_due:
+                try:
+                    with paddle.no_grad():
+                        self._compute_gate_spectrum_metrics(layer_idx, moe_layer)
+                except Exception as e:
+                    if self.verbose:
+                        logger.error(f"[PaddleMoEMonitor] gate-spectrum collect error layer {layer_idx}: {e}")
             try:
                 with paddle.no_grad():
                     routed_sq, shared_sq, group = self._collect_expert_sumsq(moe_layer)
@@ -848,7 +872,16 @@ class PaddleMoEMonitor(PaddleProbe):
         """Spectrum health of the experts' SwiGLU gate projection.
 
         One batched Gram eigensolve per layer covers every local expert plus the
-        shared expert. The per-expert stable ranks / entropies are reduced to
+        shared expert. This is the most expensive thing this monitor does -- at
+        the 4B-A500M shapes it measures 188 ms/layer against ~1 ms for the router
+        and norm metrics, i.e. ~58% of the whole internal-medicine bill -- so it
+        is called on a ``gate_spectrum_interval`` clock rather than on every
+        monitored step. Cross-layer batching was measured and is not the answer:
+        one ``[594, k, k]`` solve beats 18 ``[33, k, k]`` ones by only 1.22x,
+        because the cost is the 594 ``syevj`` factorisations themselves and not
+        the launches.
+
+        The per-expert stable ranks / entropies are reduced to
         mean/min/max so the key count stays per-layer: 256 experts x 18 layers
         would otherwise be 4608 series. Under expert parallelism each rank holds
         its own shard of experts; the ``_max`` / ``_min`` keys reduce correctly
@@ -992,12 +1025,14 @@ def setup_moe_monitor(
     monitor_interval=1,
     verbose=False,
     monitor_dict=None,
+    gate_spectrum_interval=5,
 ):
     monitor = PaddleMoEMonitor(
         log_per_layer=log_per_layer,
         log_global=log_global,
         monitor_interval=monitor_interval,
         verbose=verbose,
+        gate_spectrum_interval=gate_spectrum_interval,
     )
     monitor.register_hooks(model)
     logger.info(f"[PaddleMoEMonitor] Setup complete. Monitoring {len(monitor.hooks)} hooks.")
