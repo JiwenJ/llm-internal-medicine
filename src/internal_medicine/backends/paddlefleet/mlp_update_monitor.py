@@ -76,7 +76,14 @@ import paddle
 
 from .base import PaddleProbe
 from .layer_discovery import get_decoder_layers, iter_monitor_layers
-from .moe_monitor import _expert_fc1_weight, _singular_value_entropy, _swiglu_gate_half
+from .moe_monitor import (
+    _EPS,
+    _expert_fc1_weight,
+    _frobenius,
+    _sigma_max,
+    _singular_value_entropy,
+    _swiglu_gate_half,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -86,10 +93,6 @@ MATRIX_NAMES = ("gate", "up", "down")
 _SPREAD_KEYS = ("mean", "median", "p10", "p90", "min", "max")
 # Reduced summary set for the spectral statistics.
 _RANK_KEYS = ("mean", "min", "max")
-# Power-iteration steps for sigma_1. 30 keeps a rank-dominated update exact and a
-# flat one inside ~1.2%; see the module docstring for the measured table.
-_POWER_ITERS = 30
-_EPS = 1e-12
 
 
 def metric_names(log_spectrum: bool = False, with_shared: bool = True) -> tuple[str, ...]:
@@ -159,44 +162,6 @@ def _as_stack(weight):
     """
     matrices = weight.detach().astype("float32")
     return matrices if len(matrices.shape) > 2 else matrices.unsqueeze(0)
-
-
-def _frobenius(matrices):
-    """``||.||_F`` of every matrix in a ``[..., m, n]`` stack -> ``[...]``."""
-    return paddle.sqrt((matrices * matrices).sum(axis=[-2, -1]))
-
-
-def _deterministic_start(width: int):
-    """Unit start vector for the power iteration, drawn without the global RNG.
-
-    ``paddle.randn`` would consume the global generator and shift every
-    downstream draw (dropout, router noise) on monitored steps only, which would
-    make the run irreproducible against an unmonitored one. A fixed irrational
-    stride gives a vector with no particular relation to the weight layout, which
-    is all the iteration needs.
-    """
-    index = paddle.arange(width, dtype="float32")
-    vector = paddle.sin(index * 0.7071067811865476 + 1.0).reshape([width, 1])
-    return vector / paddle.linalg.norm(vector).clip(min=_EPS)
-
-
-def _sigma_max(matrices, iters: int = _POWER_ITERS):
-    """Largest singular value of every matrix in a ``[E, m, n]`` stack -> ``[E]``.
-
-    Power iteration on ``A^T A``, which needs only matrix-vector products: at
-    these shapes it is ~45x cheaper than the eigensolve that would give the whole
-    spectrum, and the stable rank needs nothing but ``sigma_1``. Converges as
-    ``(sigma_2 / sigma_1)^(2 * iters)``; error is one-sided (low), so the stable
-    rank it feeds is biased high.
-    """
-    vector = paddle.broadcast_to(
-        _deterministic_start(matrices.shape[-1]).unsqueeze(0),
-        [matrices.shape[0], matrices.shape[-1], 1],
-    )
-    for _ in range(iters):
-        vector = paddle.matmul(matrices, paddle.matmul(matrices, vector), transpose_x=True)
-        vector = vector / paddle.linalg.norm(vector, axis=-2, keepdim=True).clip(min=_EPS)
-    return paddle.linalg.norm(paddle.matmul(matrices, vector), axis=-2).squeeze(-1)
 
 
 def _spread(values):

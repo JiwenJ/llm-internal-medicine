@@ -27,6 +27,14 @@ from .layer_discovery import get_decoder_layers, iter_monitor_layers
 
 logger = logging.getLogger(__name__)
 
+# Power-iteration steps for sigma_1 on an update matrix (mlp_update's delta W).
+_POWER_ITERS = 30
+# Steps for sigma_1 on a weight matrix. Higher because a gate matrix's spectrum is
+# far flatter than an update's, which is the slow case for the iteration; see the
+# measured table in _stable_rank_without_spectrum.
+_GATE_POWER_ITERS = 100
+_EPS = 1e-12
+
 
 def _compute_router_entropy(probs):
     """Router entropy from probability distribution. probs: [tokens, experts]."""
@@ -292,6 +300,71 @@ def _stable_rank(sigma):
     return sq.sum(axis=-1) / sq.max(axis=-1).clip(min=1e-12)
 
 
+def _frobenius(matrices):
+    """``||.||_F`` of every matrix in a ``[..., m, n]`` stack -> ``[...]``."""
+    return paddle.sqrt((matrices * matrices).sum(axis=[-2, -1]))
+
+
+def _deterministic_start(width: int):
+    """Unit start vector for the power iteration, drawn without the global RNG.
+
+    ``paddle.randn`` would consume the global generator and shift every
+    downstream draw (dropout, router noise) on monitored steps only, which would
+    make the run irreproducible against an unmonitored one. A fixed irrational
+    stride gives a vector with no particular relation to the weight layout, which
+    is all the iteration needs.
+    """
+    index = paddle.arange(width, dtype="float32")
+    vector = paddle.sin(index * 0.7071067811865476 + 1.0).reshape([width, 1])
+    return vector / paddle.linalg.norm(vector).clip(min=_EPS)
+
+
+def _sigma_max(matrices, iters: int = _POWER_ITERS):
+    """Largest singular value of every matrix in a ``[E, m, n]`` stack -> ``[E]``.
+
+    Power iteration on ``A^T A``, which needs only matrix-vector products.
+    Converges as ``(sigma_2 / sigma_1)^(2 * iters)``; the error is one-sided
+    (low), so any stable rank it feeds is biased high.
+    """
+    vector = paddle.broadcast_to(
+        _deterministic_start(matrices.shape[-1]).unsqueeze(0),
+        [matrices.shape[0], matrices.shape[-1], 1],
+    )
+    for _ in range(iters):
+        vector = paddle.matmul(matrices, paddle.matmul(matrices, vector), transpose_x=True)
+        vector = vector / paddle.linalg.norm(vector, axis=-2, keepdim=True).clip(min=_EPS)
+    return paddle.linalg.norm(paddle.matmul(matrices, vector), axis=-2).squeeze(-1)
+
+
+def _stable_rank_without_spectrum(matrices, iters: int = _GATE_POWER_ITERS):
+    """``srank`` from ``||A||_F`` and a power-iterated ``sigma_1``, no eigensolve.
+
+    The same quantity :func:`_stable_rank` returns, but it never asks for the
+    whole spectrum, because ``eigvalsh`` is 99.7% of that path and matrix-vector
+    products replace it entirely.
+
+    The price is the power iteration's one-sided error: an underestimated
+    ``sigma_1`` can only inflate srank. Measured against the full spectrum on a
+    random ``[32, 512, 512]`` stack -- the hardest case, since a Gaussian spectrum
+    puts ``sigma_2 / sigma_1`` right at 1 -- over the 17 MoE layers:
+
+    * 30 iterations: mean 1.6% high, worst expert 4.7% high, 30 ms
+    * 100 iterations: mean 0.2% high, worst 1.2% high, 90 ms
+    * 200 iterations: mean 0.06% high, worst 0.8% high, 189 ms
+    * full spectrum: exact, 1004 ms
+
+    100 is the default. A trained gate's spectrum decays rather than sitting flat,
+    so that table is an upper bound on the error, and 1.2% is well inside the
+    drift this metric is read for. Collapse onto few directions -- the case the
+    metric exists to detect -- is where the iteration is exact.
+
+    ``[E, m, n]`` in, ``[E]`` out.
+    """
+    frobenius = _frobenius(matrices)
+    sigma_max = _sigma_max(matrices, iters=iters)
+    return (frobenius * frobenius) / (sigma_max * sigma_max).clip(min=_EPS)
+
+
 def _singular_value_entropy(sigma):
     """Shannon entropy of the squared-singular-value distribution (alpha = 2).
 
@@ -414,11 +487,12 @@ class PaddleMoEMonitor(PaddleProbe):
         )
         if int(gate_spectrum_interval) < 1:
             raise ValueError(f"gate_spectrum_interval must be >= 1, got {gate_spectrum_interval}")
-        # The gate spectrum is a full eigensolve per (layer, expert) and measures
-        # ~58% of this monitor's cost, against router and norm metrics that are
-        # cheap. A weight spectrum moves over thousands of steps, so it rides a
-        # coarser clock: one reading every ``gate_spectrum_interval``-th
-        # monitored step. Set it to 1 to restore a reading on every one.
+        # Only the gate *entropy* needs the full eigensolve, and that solve was
+        # ~58% of this monitor's cost. A weight spectrum moves over thousands of
+        # steps, so the entropy rides a coarser clock: one reading every
+        # ``gate_spectrum_interval``-th monitored step. Set it to 1 to restore a
+        # reading on every one. The stable rank does not ride this clock -- it
+        # comes from a power iteration and is cheap enough to read every time.
         self.gate_spectrum_interval = int(gate_spectrum_interval)
         self._gate_spectrum_samples = 0
         self._patched_gates = []
@@ -731,9 +805,9 @@ class PaddleMoEMonitor(PaddleProbe):
     def collect_expert_norms(self):
         """Compute per-layer expert weight norms for all monitored MoE layers.
 
-        The gate spectrum rides ``gate_spectrum_interval``; the norms below are
-        cheap and are read on every monitored step. Sample 0 is due, so the first
-        monitored step still carries a spectrum reading.
+        Only the gate *entropy* rides ``gate_spectrum_interval``; the stable rank
+        and the norms are cheap enough to read on every monitored step. Sample 0
+        is due, so the first monitored step still carries an entropy reading.
         """
         if not self._buffers_allocated or not self._should_monitor():
             return
@@ -742,13 +816,12 @@ class PaddleMoEMonitor(PaddleProbe):
         pending = []
         shard_group = None
         for layer_idx, moe_layer in self._expert_norm_layers:
-            if spectrum_due:
-                try:
-                    with paddle.no_grad():
-                        self._compute_gate_spectrum_metrics(layer_idx, moe_layer)
-                except Exception as e:
-                    if self.verbose:
-                        logger.error(f"[PaddleMoEMonitor] gate-spectrum collect error layer {layer_idx}: {e}")
+            try:
+                with paddle.no_grad():
+                    self._compute_gate_spectrum_metrics(layer_idx, moe_layer, full_spectrum=spectrum_due)
+            except Exception as e:
+                if self.verbose:
+                    logger.error(f"[PaddleMoEMonitor] gate-spectrum collect error layer {layer_idx}: {e}")
             try:
                 with paddle.no_grad():
                     routed_sq, shared_sq, group = self._collect_expert_sumsq(moe_layer)
@@ -868,18 +941,24 @@ class PaddleMoEMonitor(PaddleProbe):
             self.record_layer_metric(layer_idx, "router_scalar_min", scalar.min())
             self.record_layer_metric(layer_idx, "router_scalar_ratio", scalar.max() / scalar.min().clip(min=1e-8))
 
-    def _compute_gate_spectrum_metrics(self, layer_idx, moe_layer):
+    def _compute_gate_spectrum_metrics(self, layer_idx, moe_layer, full_spectrum=True):
         """Spectrum health of the experts' SwiGLU gate projection.
 
-        One batched Gram eigensolve per layer covers every local expert plus the
-        shared expert. This is the most expensive thing this monitor does -- at
-        the 4B-A500M shapes it measures 188 ms/layer against ~1 ms for the router
-        and norm metrics, i.e. ~58% of the whole internal-medicine bill -- so it
-        is called on a ``gate_spectrum_interval`` clock rather than on every
-        monitored step. Cross-layer batching was measured and is not the answer:
-        one ``[594, k, k]`` solve beats 18 ``[33, k, k]`` ones by only 1.22x,
-        because the cost is the 594 ``syevj`` factorisations themselves and not
-        the launches.
+        The two metrics ride different clocks because they need different things:
+
+        * ``stable_rank`` needs only ``||A||_F`` and ``sigma_1``, so it comes from
+          :func:`_stable_rank_without_spectrum` on every monitored step. 34 ms
+          over the 17 MoE layers.
+        * ``singular_entropy`` weighs the whole spectrum and cannot avoid the
+          eigensolve, so it runs when ``full_spectrum`` is set, i.e. every
+          ``gate_spectrum_interval``-th monitored step. 2493 ms over 17 layers,
+          which was ~58% of the whole internal-medicine bill when it ran every
+          time.
+
+        Cross-layer batching was measured and is not the answer for the
+        eigensolve: one ``[594, k, k]`` solve beats 18 ``[33, k, k]`` ones by only
+        1.22x, because the cost is the 594 ``syevj`` factorisations themselves and
+        not the launches.
 
         The per-expert stable ranks / entropies are reduced to
         mean/min/max so the key count stays per-layer: 256 experts x 18 layers
@@ -901,8 +980,23 @@ class PaddleMoEMonitor(PaddleProbe):
         fc1 = _expert_fc1_weight(moe_layer)
         shared = getattr(moe_layer, "shared_experts", None)
         shared_fc1 = getattr(getattr(shared, "up_gate_proj", None), "weight", None)
-        routed_gram = _gram(_swiglu_gate_half(fc1)) if fc1 is not None else None
-        shared_gram = _gram(_swiglu_gate_half(shared_fc1)) if shared_fc1 is not None else None
+        routed_gate = _swiglu_gate_half(fc1).detach().astype("float32") if fc1 is not None else None
+        shared_gate = _swiglu_gate_half(shared_fc1).detach().astype("float32") if shared_fc1 is not None else None
+
+        if routed_gate is not None:
+            srank = _stable_rank_without_spectrum(routed_gate)
+            self.record_layer_metric(layer_idx, "expert_gate_stable_rank_mean", srank.mean())
+            self.record_layer_metric(layer_idx, "expert_gate_stable_rank_min", srank.min())
+            self.record_layer_metric(layer_idx, "expert_gate_stable_rank_max", srank.max())
+        if shared_gate is not None:
+            shared_srank = _stable_rank_without_spectrum(shared_gate.unsqueeze(0))
+            self.record_layer_metric(layer_idx, "shared_gate_stable_rank", shared_srank.squeeze(0))
+
+        if not full_spectrum:
+            return
+
+        routed_gram = _gram(routed_gate)
+        shared_gram = _gram(shared_gate)
 
         if routed_gram is not None and shared_gram is not None and shared_gram.shape == routed_gram.shape[1:]:
             sigma = _gram_singular_values(paddle.concat([routed_gram, shared_gram.unsqueeze(0)], axis=0))
@@ -912,16 +1006,12 @@ class PaddleMoEMonitor(PaddleProbe):
             shared_sigma = _gram_singular_values(shared_gram)
 
         if routed_sigma is not None:
-            for name, vals in (
-                ("stable_rank", _stable_rank(routed_sigma)),
-                ("singular_entropy", _singular_value_entropy(routed_sigma)),
-            ):
-                self.record_layer_metric(layer_idx, f"expert_gate_{name}_mean", vals.mean())
-                self.record_layer_metric(layer_idx, f"expert_gate_{name}_min", vals.min())
-                self.record_layer_metric(layer_idx, f"expert_gate_{name}_max", vals.max())
+            vals = _singular_value_entropy(routed_sigma)
+            self.record_layer_metric(layer_idx, "expert_gate_singular_entropy_mean", vals.mean())
+            self.record_layer_metric(layer_idx, "expert_gate_singular_entropy_min", vals.min())
+            self.record_layer_metric(layer_idx, "expert_gate_singular_entropy_max", vals.max())
 
         if shared_sigma is not None:
-            self.record_layer_metric(layer_idx, "shared_gate_stable_rank", _stable_rank(shared_sigma))
             self.record_layer_metric(layer_idx, "shared_gate_singular_entropy", _singular_value_entropy(shared_sigma))
 
     def _collect_expert_sumsq(self, moe_layer):

@@ -525,6 +525,52 @@ class PaddleMoEMonitorTest(unittest.TestCase):
         got = float(moe_monitor_module._stable_rank(moe_monitor_module._singular_values(w)))
         self.assertAlmostEqual(got, reference, places=3)
 
+    def test_stable_rank_without_spectrum_is_exact_when_the_spectrum_concentrates(self):
+        """The power iteration converges as (sigma_2/sigma_1)^(2k), so a
+        rank-dominated matrix -- the case this metric exists to detect -- agrees
+        with the full-spectrum value.
+        """
+        paddle.seed(0)
+        left, _ = paddle.linalg.qr(paddle.randn([16, 16]))
+        right, _ = paddle.linalg.qr(paddle.randn([16, 16]))
+        sigma = paddle.to_tensor([4.0] + [1.0] * 15, dtype="float32")  # sigma_2/sigma_1 = 0.25
+        w = paddle.matmul(left * sigma.reshape([1, -1]), right, transpose_y=True)
+
+        reference = float(moe_monitor_module._stable_rank(moe_monitor_module._singular_values(w)))
+        got = float(moe_monitor_module._stable_rank_without_spectrum(w.unsqueeze(0))[0])
+
+        self.assertAlmostEqual(got, reference, places=4)
+
+    def test_stable_rank_without_spectrum_is_biased_high_on_a_flat_spectrum(self):
+        """A flat spectrum converges slowest. The error has to stay one-sided --
+        an underestimated sigma_1 can only inflate srank -- and small, and it lands
+        where the exact value carries no diagnostic weight anyway.
+        """
+        paddle.seed(0)
+        w = paddle.randn([32, 64, 64])
+
+        reference = moe_monitor_module._stable_rank(moe_monitor_module._singular_values(w))
+        got = moe_monitor_module._stable_rank_without_spectrum(w)
+        ratio = got / reference
+
+        self.assertGreaterEqual(float(ratio.min()), 1.0 - 1e-5, "the error must never understate srank")
+        self.assertLess(float(ratio.max()), 1.02)
+
+    def test_stable_rank_without_spectrum_error_shrinks_with_more_iterations(self):
+        """Pins the direction of the accuracy/cost knob: 30 iterations is visibly
+        worse than the 100 the gate path defaults to, which is why it is not shared
+        with mlp_update's delta matrices.
+        """
+        paddle.seed(0)
+        w = paddle.randn([16, 64, 64])
+        reference = moe_monitor_module._stable_rank(moe_monitor_module._singular_values(w))
+
+        coarse = moe_monitor_module._stable_rank_without_spectrum(w, iters=30) / reference
+        fine = moe_monitor_module._stable_rank_without_spectrum(w, iters=200) / reference
+
+        self.assertLess(float(fine.max()), float(coarse.max()))
+        self.assertGreaterEqual(float(fine.min()), 1.0 - 1e-5)
+
     def test_singular_value_entropy_of_orthogonal_matrix_equals_log_full_rank(self):
         """Flat spectrum => H == log(min(m, n)), the entropy upper bound."""
         q, _ = paddle.linalg.qr(paddle.randn([32, 32]))
@@ -732,24 +778,26 @@ class PaddleMoEMonitorTest(unittest.TestCase):
             keys = training_logs.get_latest(prefix="moe_health")
             seen.append(
                 (
+                    "moe_health/layer_0/expert_gate_singular_entropy_mean" in keys,
                     "moe_health/layer_0/expert_gate_stable_rank_mean" in keys,
                     "moe_health/layer_0/expert_norm_mean" in keys,
                 )
             )
         return seen
 
-    def test_gate_spectrum_rides_a_coarser_clock_than_the_expert_norms(self):
-        """The eigensolve is ~58% of this monitor's cost while a weight spectrum
-        moves over thousands of steps, so it is read every
-        ``gate_spectrum_interval``-th monitored step. The norms are cheap and stay
-        on every one.
+    def test_only_the_gate_entropy_rides_the_coarser_clock(self):
+        """The entropy weighs the whole spectrum and cannot avoid the eigensolve --
+        ~58% of this monitor's cost -- so it is read every
+        ``gate_spectrum_interval``-th monitored step. The stable rank comes from a
+        power iteration and the norms are cheap, so both stay on every step.
         """
         monitor = self._spectrum_clock_monitor(self._spectrum_clock_layer(), gate_spectrum_interval=3)
 
         seen = self._spectrum_clock_trace(monitor)
 
-        self.assertEqual([spectrum for spectrum, _ in seen], [True, False, False, True, False, False, True])
-        self.assertEqual([norm for _, norm in seen], [True] * 7)
+        self.assertEqual([entropy for entropy, _, _ in seen], [True, False, False, True, False, False, True])
+        self.assertEqual([srank for _, srank, _ in seen], [True] * 7)
+        self.assertEqual([norm for _, _, norm in seen], [True] * 7)
 
     def test_gate_spectrum_interval_of_one_reads_every_monitored_step(self):
         """The pre-clock behaviour has to remain reachable."""
@@ -757,7 +805,7 @@ class PaddleMoEMonitorTest(unittest.TestCase):
 
         seen = self._spectrum_clock_trace(monitor, steps=4)
 
-        self.assertEqual([spectrum for spectrum, _ in seen], [True] * 4)
+        self.assertEqual([entropy for entropy, _, _ in seen], [True] * 4)
 
     def test_gate_spectrum_interval_rejects_non_positive_values(self):
         """It is a modulus; 0 would raise mid-training instead of at setup."""
